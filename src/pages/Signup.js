@@ -7,6 +7,7 @@ function Signup() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [profilePic, setProfilePic] = useState("");
+  const [error, setError] = useState("");
   const { signup } = useContext(AuthContext);
   const navigate = useNavigate();
 
@@ -23,26 +24,37 @@ function Signup() {
     }
   };
 
-  const handleSignup = (e) => {
+  const handleSignup = async (e) => {
     e.preventDefault();
-    signup(username, email, password, profilePic);
-    navigate("/");
+    setError("");
+
+    try {
+      await signup(username, email, password, profilePic);
+      navigate("/chat");
+    } catch (err) {
+      setError(err.message || "Signup failed");
+    }
   };
 
   return (
     <div className="auth-bg d-flex justify-content-center align-items-center">
       <div className="auth-card animate__animated animate__fadeInDown">
-<h2 className="text-center text-warning fw-bold mb-1">
-  Chattrix
-</h2>
+        <h2 className="text-center text-warning fw-bold mb-1">Chattrix</h2>
 
-<p className="text-center text-light mb-4">
-  Create Your Account
-</p>
+        <p className="text-center text-light mb-4">
+          Create Your Account
+        </p>
 
-<h4 className="text-center mb-3 text-white">
-  Signup
-</h4>
+        <h4 className="text-center mb-3 text-white">
+          Signup
+        </h4>
+
+        {error && (
+          <div className="alert alert-danger text-center">
+            {error}
+          </div>
+        )}
+
         <form onSubmit={handleSignup}>
           <input
             type="text"

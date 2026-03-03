@@ -9,7 +9,17 @@ import { AuthProvider, AuthContext } from "./context/AuthContext";
 function PrivateRoute({ children }) {
   return (
     <AuthContext.Consumer>
-      {({ user }) => (user ? children : <Navigate to="/" />)}
+      {({ user, loading }) =>
+        loading ? (
+          <div style={{ color: "white", textAlign: "center", marginTop: "2rem" }}>
+            Checking session...
+          </div>
+        ) : user ? (
+          children
+        ) : (
+          <Navigate to="/" />
+        )
+      }
     </AuthContext.Consumer>
   );
 }
