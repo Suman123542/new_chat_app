@@ -20,6 +20,7 @@ function Chat() {
   const [messages, setMessages] = useState([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
   const [showAttachOptions, setShowAttachOptions] = useState(false);
   const [attachment, setAttachment] = useState(null); // {url,name,type,kind}
   const chatScrollRef = useRef(null); // to auto-scroll when messages update
@@ -31,6 +32,8 @@ function Chat() {
   const [profileBio, setProfileBio] = useState("");
   const [profileImage, setProfileImage] = useState(null);
   const [updatingProfile, setUpdatingProfile] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileSuccess, setProfileSuccess] = useState("");
   const [onlineUserIds, setOnlineUserIds] = useState([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [apiConnected, setApiConnected] = useState(false);
@@ -281,9 +284,11 @@ function Chat() {
 
   const handleUpdateProfile = async (e) => {
     e.preventDefault();
+    setProfileError("");
+    setProfileSuccess("");
     setUpdatingProfile(true);
     try {
-      await updateProfile({
+      const updated = await updateProfile({
         name: profileName,
         bio: profileBio,
         profilePic: profileImage || undefined,
@@ -291,9 +296,12 @@ function Chat() {
 
       // Refresh list so updated profilePic shows immediately in Users section
       await refreshUsers?.();
-      setShowProfile(false);
+      setProfileSuccess("Profile updated successfully");
+      // keep the modal open briefly so user sees the message
+      setTimeout(() => setShowProfile(false), 1000);
     } catch (err) {
       console.warn(err);
+      setProfileError(err.message || "Update failed");
     } finally {
       setUpdatingProfile(false);
     }
@@ -316,26 +324,28 @@ function Chat() {
     });
     setShowAttachOptions(false);
 
-    // immediately send file if there's nothing to type (speeds up sharing)
-    // delay slightly to ensure state updates have occurred
+    // auto-send the file immediately; pass selectedFile to avoid state timing issue
     setTimeout(() => {
       if (!message && selectedFile && selectedUser && token) {
-        handleSend();
+        handleSend(selectedFile);
       }
-    }, 50);
+    }, 20);
   };
 
-  const handleSend = () => {
-    if ((!message && !file) || !selectedUser || !token) return;
+  // optionally pass a file directly to avoid race conditions when auto‑sending
+  const handleSend = (overrideFile) => {
+    setSendError("");
+    const fileToSend = overrideFile || file;
+    if ((!message && !fileToSend) || !selectedUser || !token) return;
 
     setSending(true);
     setUploadProgress(0);
 
     // if there's an attached file, send as multipart/form-data to avoid base64
-    if (file) {
+    if (fileToSend) {
       const form = new FormData();
       form.append("text", message || "");
-      form.append("file", file, file.name);
+      form.append("file", fileToSend, fileToSend.name);
 
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `${API}/messages/send/${selectedUser.id}`);
@@ -355,8 +365,13 @@ function Chat() {
           setAttachment(null);
           setFile(null);
           refreshUsers?.();
+          // emit via socket as backup if server didn't
+          if (socketRef.current) {
+            socketRef.current.emit("sentMessage", newMsg);
+          }
         } catch (err) {
           console.warn(err);
+          setSendError(err.message || "Unable to send file");
         } finally {
           setSending(false);
           setUploadProgress(0);
@@ -364,6 +379,7 @@ function Chat() {
       };
       xhr.onerror = () => {
         console.warn("Upload error");
+        setSendError("Network error uploading file");
         setSending(false);
         setUploadProgress(0);
       };
@@ -389,6 +405,7 @@ function Chat() {
           refreshUsers?.();
         } catch (err) {
           console.warn(err);
+          setSendError(err.message || "Failed to send message");
         } finally {
           setSending(false);
         }
@@ -569,6 +586,17 @@ function Chat() {
                   onChange={handleFileChangeProfile}
                 />
               </div>
+
+              {profileError && (
+                <div className="alert alert-danger" role="alert">
+                  {profileError}
+                </div>
+              )}
+              {profileSuccess && (
+                <div className="alert alert-success" role="alert">
+                  {profileSuccess}
+                </div>
+              )}
 
               <button
                 type="submit"
@@ -818,6 +846,11 @@ function Chat() {
                     value={message}
                     onChange={(e) => setMessage(e.target.value)}
                   />
+                  {sendError && (
+                    <div className="text-danger small mt-1">
+                      {sendError}
+                    </div>
+                  )}
 
                   {/* File Upload Button */}
                   <div className="position-relative">
