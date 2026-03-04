@@ -9,6 +9,7 @@ export const AuthProvider = ({ children }) => {
   const [token, setToken] = useState(null);
   const [loading, setLoading] = useState(true);
   const [users, setUsers] = useState([]);
+  const [unseenMessages, setUnseenMessages] = useState({});
 
   const fetchUsers = async (authToken) => {
     if (!authToken) return;
@@ -25,8 +26,12 @@ export const AuthProvider = ({ children }) => {
 
       const data = await res.json();
       setUsers(data.users || []);
+      setUnseenMessages(data.unseenMessages || {});
     } catch (err) {
-      console.error("Error fetching users:", err);
+      // network or server error while loading users; warn in dev but don't spam console
+      console.warn("Error fetching users:", err);
+      setUsers([]);
+      setUnseenMessages({});
     }
   };
 
@@ -52,7 +57,7 @@ export const AuthProvider = ({ children }) => {
         setToken(savedToken);
         await fetchUsers(savedToken);
       } catch (err) {
-        console.error(err);
+        console.warn(err);
         localStorage.removeItem("token");
       } finally {
         setLoading(false);
@@ -148,7 +153,7 @@ export const AuthProvider = ({ children }) => {
 
   return (
     <AuthContext.Provider
-      value={{ user, users, token, signup, login, logout, loading, refreshUsers, updateProfile }}
+      value={{ user, users, unseenMessages, token, signup, login, logout, loading, refreshUsers, updateProfile }}
     >
       {children}
     </AuthContext.Provider>

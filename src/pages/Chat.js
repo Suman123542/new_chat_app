@@ -6,11 +6,12 @@ import { io } from "socket.io-client";
 function Chat() {
   const API = "http://localhost:5000/api";
   const SOCKET_URL = "http://localhost:5000";
-  const [file, setFile] = useState(null);
+  const [file, setFile] = useState(null); // raw File object for uploads
+  const [uploadProgress, setUploadProgress] = useState(0); // 0-1
   const [showMenu, setShowMenu] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
 
-  const { user, users, token, logout, refreshUsers, updateProfile } =
+  const { user, users, unseenMessages, token, logout, refreshUsers, updateProfile } =
     useContext(AuthContext);
   const navigate = useNavigate();
 
@@ -19,6 +20,9 @@ function Chat() {
   const [messages, setMessages] = useState([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
+  const [showAttachOptions, setShowAttachOptions] = useState(false);
+  const [attachment, setAttachment] = useState(null); // {url,name,type,kind}
+  const chatScrollRef = useRef(null); // to auto-scroll when messages update
   const [showSettings, setShowSettings] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
   const [notifications, setNotifications] = useState([]);
@@ -28,20 +32,72 @@ function Chat() {
   const [profileImage, setProfileImage] = useState(null);
   const [updatingProfile, setUpdatingProfile] = useState(false);
   const [onlineUserIds, setOnlineUserIds] = useState([]);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [apiConnected, setApiConnected] = useState(false);
+  const [socketConnected, setSocketConnected] = useState(false);
 
   const settingsRef = useRef();
   const socketRef = useRef(null);
   const selectedUserRef = useRef(null);
+  const profileInputRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const photoInputRef = useRef(null);
+  const videoInputRef = useRef(null);
+  const audioInputRef = useRef(null);
+  const lastLoadedRef = useRef(null);
+  const initialFetchRef = useRef(true);
 
   // Map backend users to the shape used in the UI
   // UI excludes the currently logged-in user (Messenger style)
+  // show all registered users except self, mark whether they're online
   const allUsers = (users || [])
     .filter((u) => String(u._id) !== String(user?._id))
     .map((u) => ({
       id: u._id,
       username: u.name,
       profilePic: u.profilePic,
+      online: onlineUserIds.includes(String(u._id)),
+      bio: u.bio || "",
     }));
+
+  // apply search term to user list
+  const filteredUsers = allUsers.filter((u) =>
+    u.username.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  // helper to render avatar either image or initial
+  const renderAvatar = (profilePic, name, size = 40) => {
+    if (profilePic) {
+      return (
+        <img
+          src={profilePic}
+          alt="profile"
+          className="rounded-circle"
+          width={size}
+          height={size}
+        />
+      );
+    }
+    const initial = name ? name.charAt(0).toUpperCase() : "?";
+    return (
+      <div
+        style={{
+          width: size,
+          height: size,
+          borderRadius: "50%",
+          background: "#000",
+          color: "#fff",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontWeight: "bold",
+          fontSize: size / 2,
+        }}
+      >
+        {initial}
+      </div>
+    );
+  };
 
   useEffect(() => {
     selectedUserRef.current = selectedUser;
@@ -57,8 +113,41 @@ function Chat() {
     if (user) {
       setProfileName(user.name || "");
       setProfileBio(user.bio || "");
+      setProfileImage(user.profilePic || null);
     }
-  }, [user]);
+
+    // simple API connectivity check
+    const checkApi = async () => {
+      try {
+        const res = await fetch(`${API}/auth/check`, {
+          headers: { Authorization: token },
+        });
+        if (res.ok) setApiConnected(true);
+      } catch (e) {
+        setApiConnected(false);
+      }
+    };
+
+    if (token) checkApi();
+  }, [user, token]);
+  // whenever we switch to a different conversation, clear any draft/attachment
+  useEffect(() => {
+    setMessage("");
+    setAttachment(null);
+    setFile(null);
+    setUploadProgress(0);
+    setSending(false);
+    // reset initialFetch so spinner can show for the new partner if desired
+    initialFetchRef.current = true;
+    lastLoadedRef.current = null;
+  }, [selectedUser]);
+
+  // auto-scroll to bottom when messages or attachment change
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [messages, attachment]);
 
   // Real-time messaging via Socket.IO
   useEffect(() => {
@@ -76,11 +165,16 @@ function Chat() {
       reconnectionAttempts: 10,
       reconnectionDelay: 500,
     });
+    socket.on("connect", () => setSocketConnected(true));
+    socket.on("disconnect", () => setSocketConnected(false));
 
     socketRef.current = socket;
 
     socket.on("onlineUsers", (ids) => {
-      setOnlineUserIds(Array.isArray(ids) ? ids : []);
+      const list = Array.isArray(ids) ? ids : [];
+      setOnlineUserIds(list);
+      // when online list changes also refresh user sidebar (in case filter applied)
+      refreshUsers?.();
     });
 
     socket.on("newMessage", (newMessage) => {
@@ -94,6 +188,9 @@ function Chat() {
         setMessages((prev) => [...prev, newMessage]);
         return;
       }
+
+      // increment unseen counts by re-fetching user list
+      refreshUsers?.();
 
       // Otherwise add a simple notification
       setNotifications((prev) => [
@@ -126,11 +223,20 @@ function Chat() {
   }, []);
 
   // Load messages
+  // (refs declared earlier near other useRefs)
   useEffect(() => {
     if (!selectedUser || !token) return;
 
+    // don't refetch if we already loaded for this user and still have messages
+    if (
+      lastLoadedRef.current === selectedUser.id &&
+      messages.length > 0
+    ) {
+      return;
+    }
+
     const fetchMessages = async () => {
-      setLoadingMessages(true);
+      if (initialFetchRef.current) setLoadingMessages(true);
       try {
         const res = await fetch(`${API}/messages/${selectedUser.id}`, {
           headers: {
@@ -144,56 +250,19 @@ function Chat() {
         }
 
         setMessages(data.messages || []);
+        lastLoadedRef.current = selectedUser.id;
+        // update sidebar counts after marking messages seen on server
+        refreshUsers?.();
       } catch (err) {
-        console.error(err);
+        console.warn(err);
       } finally {
         setLoadingMessages(false);
+        initialFetchRef.current = false;
       }
     };
 
     fetchMessages();
-  }, [selectedUser, token]);
-
-  // Send message
-  const handleSend = () => {
-    if ((!message && !file) || !selectedUser || !token) return;
-
-    const send = async () => {
-      setSending(true);
-      try {
-        const body = {
-          text: message || "",
-          image: file ? file.data : null,
-        };
-
-        const res = await fetch(`${API}/messages/send/${selectedUser.id}`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: token,
-          },
-          body: JSON.stringify(body),
-        });
-
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.message || "Failed to send message");
-        }
-
-        const newMessage = data.newMessage;
-        setMessages((prev) => [...prev, newMessage]);
-        setMessage("");
-        setFile(null);
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setSending(false);
-      }
-    };
-
-    send();
-  };
-
+  }, [selectedUser, token, refreshUsers, messages.length]);
   const handleLogout = () => {
     logout();
     navigate("/");
@@ -224,26 +293,108 @@ function Chat() {
       await refreshUsers?.();
       setShowProfile(false);
     } catch (err) {
-      console.error(err);
+      console.warn(err);
     } finally {
       setUpdatingProfile(false);
     }
   };
-  const handleFileChange = (e) => {
+  const handleFileChange = (e, kind = "file") => {
     const selectedFile = e.target.files[0];
     if (!selectedFile) return;
 
-    const reader = new FileReader();
+    // keep raw file for upload, create preview URL for display
+    setFile(selectedFile);
+    let previewUrl = "";
+    if (kind === "photo" || kind === "video" || kind === "audio") {
+      previewUrl = URL.createObjectURL(selectedFile);
+    }
+    setAttachment({
+      name: selectedFile.name,
+      type: selectedFile.type,
+      kind,
+      url: previewUrl,
+    });
+    setShowAttachOptions(false);
 
-    reader.onloadend = () => {
-      setFile({
-        name: selectedFile.name,
-        type: selectedFile.type,
-        data: reader.result,
-      });
-    };
+    // immediately send file if there's nothing to type (speeds up sharing)
+    // delay slightly to ensure state updates have occurred
+    setTimeout(() => {
+      if (!message && selectedFile && selectedUser && token) {
+        handleSend();
+      }
+    }, 50);
+  };
 
-    reader.readAsDataURL(selectedFile);
+  const handleSend = () => {
+    if ((!message && !file) || !selectedUser || !token) return;
+
+    setSending(true);
+    setUploadProgress(0);
+
+    // if there's an attached file, send as multipart/form-data to avoid base64
+    if (file) {
+      const form = new FormData();
+      form.append("text", message || "");
+      form.append("file", file, file.name);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API}/messages/send/${selectedUser.id}`);
+      xhr.setRequestHeader("Authorization", token);
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          setUploadProgress(e.loaded / e.total);
+        }
+      };
+      xhr.onload = () => {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          if (xhr.status >= 400) throw new Error(data.message || "Failed to send message");
+          const newMsg = data.newMessage;
+          setMessages((prev) => [...prev, newMsg]);
+          setMessage("");
+          setAttachment(null);
+          setFile(null);
+          refreshUsers?.();
+        } catch (err) {
+          console.warn(err);
+        } finally {
+          setSending(false);
+          setUploadProgress(0);
+        }
+      };
+      xhr.onerror = () => {
+        console.warn("Upload error");
+        setSending(false);
+        setUploadProgress(0);
+      };
+      xhr.send(form);
+    } else {
+      // no file, simple text message
+      const send = async () => {
+        try {
+          const body = { text: message || "" };
+          const res = await fetch(`${API}/messages/send/${selectedUser.id}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: token,
+            },
+            body: JSON.stringify(body),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.message || "Failed to send message");
+          const newMsg = data.newMessage;
+          setMessages((prev) => [...prev, newMsg]);
+          setMessage("");
+          refreshUsers?.();
+        } catch (err) {
+          console.warn(err);
+        } finally {
+          setSending(false);
+        }
+      };
+      send();
+    }
   };
   return (
     <div className="chat-bg">
@@ -251,6 +402,27 @@ function Chat() {
       <nav className="navbar navbar-dark bg-primary px-3 position-relative">
         {/* App Name */}
         <h5 className="text-white m-0">Chattrix</h5>
+        <div className="d-flex align-items-center ms-3">
+          <span
+            title={apiConnected ? "API connected" : "API offline"}
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: "50%",
+              background: apiConnected ? "#22c55e" : "#ef4444",
+              marginRight: 4,
+            }}
+          />
+          <span
+            title={socketConnected ? "Socket connected" : "Socket offline"}
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: "50%",
+              background: socketConnected ? "#22c55e" : "#ef4444",
+            }}
+          />
+        </div>
 
         {/* Hamburger Button */}
         <div className="position-relative">
@@ -331,18 +503,36 @@ function Chat() {
       {showProfile && (
         <div className="profile-overlay">
           <div className="profile-card animate__animated animate__zoomIn">
-            {/* Profile Image */}
+            {/* Profile Image with edit button */}
             <form onSubmit={handleUpdateProfile}>
-              <div className="mb-3 text-center">
-                <img
-                  src={
-                    profileImage ||
-                    user?.profilePic ||
-                    "https://via.placeholder.com/120"
-                  }
-                  alt="profile"
-                  className="profile-image"
+              <div className="mb-3 text-center" style={{ position: "relative" }}>
+                {renderAvatar(
+                  profileImage || user?.profilePic,
+                  profileName || user?.name,
+                  120
+                )}
+                {/* hidden file input triggered by edit icon */}
+                <input
+                  type="file"
+                  accept="image/*"
+                  ref={profileInputRef}
+                  style={{ display: "none" }}
+                  onChange={handleFileChangeProfile}
                 />
+                <button
+                  type="button"
+                  className="btn btn-sm btn-light"
+                  style={{
+                    position: "absolute",
+                    right: "10px",
+                    bottom: "10px",
+                    borderRadius: "50%",
+                    padding: "4px 6px",
+                  }}
+                  onClick={() => profileInputRef.current && profileInputRef.current.click()}
+                >
+                  ✎
+                </button>
               </div>
 
               <div className="mb-3">
@@ -416,18 +606,26 @@ function Chat() {
                 </button>
               </div>
 
+              <div className="mb-2 mt-2">
+                <input
+                  type="text"
+                  className="form-control rounded-pill"
+                  placeholder="Search users..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                />
+              </div>
               <ul className="list-group">
-                {allUsers.length === 0 ? (
+                {filteredUsers.length === 0 ? (
                   <li className="list-group-item text-muted">
                     No registered users found.
                   </li>
                 ) : (
-                  allUsers.map((u, i) => (
+                  filteredUsers.map((u, i) => (
                     <li
                       key={i}
-                      className={`list-group-item d-flex align-items-center ${
-                        selectedUser?.username === u.username ? "active" : ""
-                      }`}
+                      className={`list-group-item d-flex align-items-center justify-content-between ${selectedUser?.username === u.username ? "active" : ""
+                        }`}
                       style={{ cursor: "pointer" }}
                       onClick={() => {
                         if (window.innerWidth < 768) {
@@ -437,36 +635,62 @@ function Chat() {
                         }
                       }}
                     >
-                      <div
-                        className="position-relative me-2"
-                        style={{ width: 40, height: 40 }}
-                      >
-                        <img
-                          src={u.profilePic || "https://via.placeholder.com/40"}
-                          alt="profile"
-                          className="rounded-circle"
-                          width="40"
-                          height="40"
-                        />
-                        <span
-                          title={
-                            onlineUserIds.includes(u.id) ? "Online" : "Offline"
-                          }
-                          style={{
-                            position: "absolute",
-                            right: 0,
-                            bottom: 0,
-                            width: 10,
-                            height: 10,
-                            borderRadius: "50%",
-                            background: onlineUserIds.includes(u.id)
-                              ? "#22c55e"
-                              : "#9ca3af",
-                            border: "2px solid white",
-                          }}
-                        />
+                      <div className="d-flex align-items-center">
+                        <div
+                          className="position-relative me-2"
+                          style={{ width: 40, height: 40 }}
+                        >
+                          {renderAvatar(u.profilePic, u.username, 40)}
+                          <span
+                            title={
+                              onlineUserIds.includes(u.id) ? "Online" : "Offline"
+                            }
+                            style={{
+                              position: "absolute",
+                              right: 0,
+                              bottom: 0,
+                              background: onlineUserIds.includes(u.id)
+                                ? "#22c55e"
+                                : "#9ca3af",
+                              width: 10,
+                              height: 10,
+                              borderRadius: "50%",
+                              border: "2px solid white",
+                            }}
+                          />
+                        </div>
+                        <div>
+                          {u.username}
+                          {u.online && (
+                            <div style={{ fontSize: '0.75rem', color: '#22c55e' }}>
+                              online
+                            </div>
+                          )}
+                        </div>
                       </div>
-                      {u.username}
+
+                      <div className="d-flex align-items-center">
+                        {/* right-end green circle showing unseen count (in addition to red badge on avatar) */}
+                        {unseenMessages && unseenMessages[u.id] && (
+                          <span
+                            title={`${unseenMessages[u.id]} unread`}
+                            style={{
+                              width: 18,
+                              height: 18,
+                              borderRadius: "50%",
+                              background: "#22c55e",
+                              color: "#fff",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              fontSize: "0.75rem",
+                              marginLeft: 8,
+                            }}
+                          >
+                            {unseenMessages[u.id]}
+                          </span>
+                        )}
+                      </div>
                     </li>
                   ))
                 )}
@@ -482,26 +706,25 @@ function Chat() {
               </div>
             ) : (
               <div className="card shadow animate__animated animate__fadeIn">
-                <div className="card-header bg-info text-white">
-                  Chat with {selectedUser.username}
+                <div className="card-header bg-info text-white d-flex align-items-center justify-content-between">
+                  <div className="d-flex flex-column">
+                    <div className="d-flex align-items-center">
+                      {renderAvatar(selectedUser.profilePic, selectedUser.username, 40)}
+                      <span className="ms-2">Chat with {selectedUser.username}</span>
+                    </div>
+                    {selectedUser.bio && (
+                      <div className="ms-5 mt-1 text-white small">
+                        {selectedUser.bio}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: '0.85rem', color: selectedUser.online ? '#22c55e' : '#d1d5db' }}>
+                    {selectedUser.online ? 'Online' : 'Offline'}
+                  </div>
                 </div>
 
-                <div className="card-header bg-info text-white d-flex align-items-center">
-                  <img
-                    src={
-                      selectedUser.profilePic ||
-                      "https://via.placeholder.com/40"
-                    }
-                    alt="profile"
-                    className="rounded-circle me-2"
-                    width="40"
-                    height="40"
-                  />
-                  Chat with {selectedUser.username}
-                </div>
-
-                <div className="chat-scroll p-3">
-                  {loadingMessages ? (
+                <div className="chat-scroll p-3" ref={chatScrollRef}>
+                  {(initialFetchRef.current && loadingMessages) ? (
                     <div className="text-center text-muted">
                       Loading messages...
                     </div>
@@ -513,28 +736,21 @@ function Chat() {
                     messages.map((msg, index) => {
                       const isMine = String(msg.senderId) === String(user?._id);
                       const avatarSrc = isMine
-                        ? user?.profilePic || "https://via.placeholder.com/32"
-                        : selectedUser?.profilePic ||
-                          "https://via.placeholder.com/32";
+                        ? user?.profilePic
+                        : selectedUser?.profilePic;
 
                       return (
                         <div
                           key={index}
-                          className={`d-flex ${
-                            isMine
-                              ? "justify-content-end"
-                              : "justify-content-start"
-                          } mb-2`}
+                          className={`d-flex ${isMine
+                            ? "justify-content-end"
+                            : "justify-content-start"
+                            } mb-2`}
                         >
                           {!isMine && (
-                            <img
-                              src={avatarSrc}
-                              alt="avatar"
-                              className="rounded-circle me-2"
-                              width="32"
-                              height="32"
-                              style={{ alignSelf: "flex-end" }}
-                            />
+                            <div className="me-2" style={{ alignSelf: "flex-end" }}>
+                              {renderAvatar(avatarSrc, isMine ? user?.name : selectedUser?.username, 32)}
+                            </div>
                           )}
 
                           <div
@@ -558,17 +774,35 @@ function Chat() {
                                 />
                               </div>
                             )}
+
+                            {msg.fileUrl && (
+                              <div className="mt-2">
+                                {msg.fileType && msg.fileType.startsWith("image") ? (
+                                  <img
+                                    src={msg.fileUrl}
+                                    alt={msg.fileName}
+                                    style={{
+                                      maxWidth: "200px",
+                                      borderRadius: "10px",
+                                    }}
+                                  />
+                                ) : (
+                                  <a
+                                    href={msg.fileUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                  >
+                                    {msg.fileName || "Download file"}
+                                  </a>
+                                )}
+                              </div>
+                            )}
                           </div>
 
                           {isMine && (
-                            <img
-                              src={avatarSrc}
-                              alt="avatar"
-                              className="rounded-circle ms-2"
-                              width="32"
-                              height="32"
-                              style={{ alignSelf: "flex-end" }}
-                            />
+                            <div className="ms-2" style={{ alignSelf: "flex-end" }}>
+                              {renderAvatar(avatarSrc, user?.name, 32)}
+                            </div>
                           )}
                         </div>
                       );
@@ -586,14 +820,102 @@ function Chat() {
                   />
 
                   {/* File Upload Button */}
-                  <label className="btn btn-secondary mb-0">
-                    📎
-                    <input type="file" hidden onChange={handleFileChange} />
-                  </label>
+                  <div className="position-relative">
+                    <button
+                      type="button"
+                      className="btn btn-secondary mb-0"
+                      onClick={() => setShowAttachOptions(!showAttachOptions)}
+                    >
+                      📎
+                    </button>
+                    {showAttachOptions && (
+                      <div
+                        className="card p-2"
+                        style={{
+                          position: "absolute",
+                          bottom: "40px",
+                          left: 0,
+                          zIndex: 1000,
+                        }}
+                      >
+                        <button
+                          className="btn btn-sm btn-light w-100 mb-1"
+                          onClick={() => photoInputRef.current && photoInputRef.current.click()}
+                        >
+                          📷 Photo
+                        </button>
+                        <button
+                          className="btn btn-sm btn-light w-100 mb-1"
+                          onClick={() => fileInputRef.current && fileInputRef.current.click()}
+                        >
+                          📁 File
+                        </button>
+                        <button
+                          className="btn btn-sm btn-light w-100 mb-1"
+                          onClick={() => videoInputRef.current && videoInputRef.current.click()}
+                        >
+                          🎥 Video
+                        </button>
+                        <button
+                          className="btn btn-sm btn-light w-100"
+                          onClick={() => audioInputRef.current && audioInputRef.current.click()}
+                        >
+                          🎵 Audio
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {attachment && (
+                    <span className="ms-2 text-white" style={{ fontSize: "0.9rem" }}>
+                      {attachment.name}
+                    </span>
+                  )}
+                  {uploadProgress > 0 && uploadProgress < 1 && (
+                    <div className="progress w-50 ms-2" style={{ height: '0.6rem' }}>
+                      <div
+                        className="progress-bar"
+                        role="progressbar"
+                        style={{ width: `${Math.round(uploadProgress * 100)}%` }}
+                        aria-valuenow={Math.round(uploadProgress * 100)}
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                      ></div>
+                    </div>
+                  )}
 
                   <button className="btn btn-primary" onClick={handleSend}>
                     {sending ? "Sending..." : "Send"}
                   </button>
+
+                  {/* hidden inputs */}
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    style={{ display: "none" }}
+                    onChange={(e) => handleFileChange(e, "file")}
+                  />
+                  <input
+                    type="file"
+                    accept="image/*"
+                    ref={photoInputRef}
+                    style={{ display: "none" }}
+                    onChange={(e) => handleFileChange(e, "photo")}
+                  />
+                  <input
+                    type="file"
+                    accept="video/*"
+                    ref={videoInputRef}
+                    style={{ display: "none" }}
+                    onChange={(e) => handleFileChange(e, "video")}
+                  />
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    ref={audioInputRef}
+                    style={{ display: "none" }}
+                    onChange={(e) => handleFileChange(e, "audio")}
+                  />
                 </div>
               </div>
             )}

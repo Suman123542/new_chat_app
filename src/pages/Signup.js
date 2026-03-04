@@ -64,6 +64,7 @@ function Signup() {
             onChange={(e) => setUsername(e.target.value)}
           />
 
+
           <input
             type="email"
             className="form-control mb-3"
