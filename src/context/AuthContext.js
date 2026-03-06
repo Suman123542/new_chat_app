@@ -1,4 +1,4 @@
-import React, { createContext, useState, useEffect } from "react";
+import React, { createContext, useState, useEffect, useCallback, useMemo } from "react";
 
 export const AuthContext = createContext();
 
@@ -11,7 +11,7 @@ export const AuthProvider = ({ children }) => {
   const [users, setUsers] = useState([]);
   const [unseenMessages, setUnseenMessages] = useState({});
 
-  const fetchUsers = async (authToken) => {
+  const fetchUsers = useCallback(async (authToken) => {
     if (!authToken) return;
     try {
       const res = await fetch(`${API}/messages/users`, {
@@ -28,12 +28,11 @@ export const AuthProvider = ({ children }) => {
       setUsers(data.users || []);
       setUnseenMessages(data.unseenMessages || {});
     } catch (err) {
-      // network or server error while loading users; warn in dev but don't spam console
       console.warn("Error fetching users:", err);
       setUsers([]);
       setUnseenMessages({});
     }
-  };
+  }, []);
 
   useEffect(() => {
     const savedToken = localStorage.getItem("token");
@@ -65,14 +64,14 @@ export const AuthProvider = ({ children }) => {
     };
 
     checkAuth();
-  }, []);
+  }, [fetchUsers]);
 
   useEffect(() => {
     if (!token) return;
     fetchUsers(token);
-  }, [token]);
+  }, [token, fetchUsers]);
 
-  const signup = async (username, email, password, profilePic) => {
+  const signup = useCallback(async (username, email, password, profilePic) => {
     const body = { name: username, email, password, profilePic };
 
     const res = await fetch(`${API}/auth/signup`, {
@@ -94,9 +93,9 @@ export const AuthProvider = ({ children }) => {
     localStorage.setItem("token", data.token);
     await fetchUsers(data.token);
     return true;
-  };
+  }, [fetchUsers]);
 
-  const login = async (email, password) => {
+  const login = useCallback(async (email, password) => {
     const res = await fetch(`${API}/auth/login`, {
       method: "POST",
       headers: {
@@ -116,45 +115,79 @@ export const AuthProvider = ({ children }) => {
     localStorage.setItem("token", data.token);
     await fetchUsers(data.token);
     return true;
-  };
+  }, [fetchUsers]);
 
-  const logout = () => {
+  const logout = useCallback(() => {
     setUser(null);
     setToken(null);
     setUsers([]);
     localStorage.removeItem("token");
-  };
+  }, []);
 
-  const refreshUsers = async () => {
+  const refreshUsers = useCallback(async () => {
     await fetchUsers(token);
-  };
+  }, [fetchUsers, token]);
 
-  const updateProfile = async ({ name, bio, profilePic }) => {
+  const updateProfile = useCallback(async ({ name, bio, profilePic, profilePicFile }) => {
     if (!token) throw new Error("Not authenticated");
 
-    const res = await fetch(`${API}/auth/update-profile`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: token,
-      },
-      body: JSON.stringify({ name, bio, profilePic }),
-    });
+    let res;
+    if (profilePicFile instanceof Blob) {
+      const form = new FormData();
+      form.append("name", name || "");
+      form.append("bio", bio || "");
+      form.append("profilePic", profilePicFile, profilePicFile.name || "profile.jpg");
+
+      res = await fetch(`${API}/auth/update-profile`, {
+        method: "PUT",
+        headers: {
+          Authorization: token,
+        },
+        body: form,
+      });
+    } else {
+      res = await fetch(`${API}/auth/update-profile`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: token,
+        },
+        body: JSON.stringify({ name, bio, profilePic }),
+      });
+    }
 
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       throw new Error(data.message || "Failed to update profile");
     }
 
-    if (data.user) setUser(data.user);
-    await fetchUsers(token);
+    setUser(data.user);
+    setUsers((prev) =>
+      (prev || []).map((u) =>
+        String(u._id) === String(data.user?._id) ? data.user : u
+      )
+    );
     return data.user;
-  };
+  }, [token]);
+
+  const value = useMemo(
+    () => ({
+      user,
+      users,
+      unseenMessages,
+      token,
+      signup,
+      login,
+      logout,
+      loading,
+      refreshUsers,
+      updateProfile,
+    }),
+    [user, users, unseenMessages, token, signup, login, logout, loading, refreshUsers, updateProfile]
+  );
 
   return (
-    <AuthContext.Provider
-      value={{ user, users, unseenMessages, token, signup, login, logout, loading, refreshUsers, updateProfile }}
-    >
+    <AuthContext.Provider value={value}>
       {children}
     </AuthContext.Provider>
   );

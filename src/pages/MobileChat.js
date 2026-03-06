@@ -1,4 +1,4 @@
-import React, { useContext, useState, useEffect, useRef } from "react";
+import React, { useCallback, useContext, useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
 import { io } from "socket.io-client";
@@ -9,7 +9,7 @@ function MobileChat() {
 
   const { username } = useParams();
   const navigate = useNavigate();
-  const { user, users, token, logout, refreshUsers } = useContext(AuthContext);
+  const { user, users, token, refreshUsers } = useContext(AuthContext);
 
   const [selectedUser, setSelectedUser] = useState(null);
   const [message, setMessage] = useState("");
@@ -18,8 +18,8 @@ function MobileChat() {
   const [sending, setSending] = useState(false);
   const [onlineUserIds, setOnlineUserIds] = useState([]);
   const [file, setFile] = useState(null);
-  const [attachment, setAttachment] = useState(null); // {url,name,type,kind}
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [sendError, setSendError] = useState("");
 
   // avatar helper copied from Chat.js
   const renderAvatar = (profilePic, name, size = 40) => {
@@ -56,12 +56,28 @@ function MobileChat() {
   };
 
   const socketRef = useRef(null);
+  const selectedUserRef = useRef(null);
+  const refreshUsersTimerRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const scheduleUsersRefresh = useCallback((delay = 250) => {
+    if (!refreshUsers) return;
+    if (refreshUsersTimerRef.current) clearTimeout(refreshUsersTimerRef.current);
+    refreshUsersTimerRef.current = setTimeout(() => {
+      refreshUsers?.();
+      refreshUsersTimerRef.current = null;
+    }, delay);
+  }, [refreshUsers]);
+
+  useEffect(() => {
+    selectedUserRef.current = selectedUser;
+  }, [selectedUser]);
 
   // refresh user list when token available
   useEffect(() => {
     if (!token) return;
-    refreshUsers();
-  }, [token, refreshUsers]);
+    scheduleUsersRefresh(0);
+  }, [token, scheduleUsersRefresh]);
 
   // compute selected user from context list
   useEffect(() => {
@@ -89,10 +105,12 @@ function MobileChat() {
     }
 
     const socket = io(SOCKET_URL, {
-      query: { userId: user._id },
+      auth: { userId: user._id },
+      transports: ["websocket"],
       reconnection: true,
       reconnectionAttempts: 10,
-      reconnectionDelay: 500,
+      reconnectionDelay: 800,
+      reconnectionDelayMax: 5000,
     });
 
     socketRef.current = socket;
@@ -102,19 +120,43 @@ function MobileChat() {
     });
 
     socket.on("newMessage", (newMessage) => {
+      const currentSelected = selectedUserRef.current;
       if (
-        selectedUser &&
-        String(newMessage.senderId) === String(selectedUser.id)
+        currentSelected &&
+        String(newMessage.senderId) === String(currentSelected.id)
       ) {
-        setMessages((prev) => [...prev, newMessage]);
+        setMessages((prev) => {
+          const exists = prev.some((m) => String(m._id) === String(newMessage._id));
+          return exists ? prev : [...prev, newMessage];
+        });
+      } else {
+        scheduleUsersRefresh(200);
+      }
+    });
+
+    socket.on("userProfileUpdated", (updatedUser) => {
+      if (!updatedUser?._id) return;
+      scheduleUsersRefresh(0);
+
+      if (String(selectedUserRef.current?.id) === String(updatedUser._id)) {
+        setSelectedUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                username: updatedUser.name ?? prev.username,
+                profilePic: updatedUser.profilePic ?? prev.profilePic,
+              }
+            : prev
+        );
       }
     });
 
     return () => {
       socket.disconnect();
       socketRef.current = null;
+      if (refreshUsersTimerRef.current) clearTimeout(refreshUsersTimerRef.current);
     };
-  }, [user?._id, selectedUser]);
+  }, [user?._id, scheduleUsersRefresh]);
 
   // load messages when selectedUser changes
   useEffect(() => {
@@ -129,8 +171,7 @@ function MobileChat() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.message || "Failed to load messages");
         setMessages(data.messages || []);
-        // after loading, refresh sidebar counts
-        refreshUsers?.();
+        scheduleUsersRefresh(250);
       } catch (err) {
         console.warn(err);
       } finally {
@@ -142,24 +183,48 @@ function MobileChat() {
 
     // clear draft state when switching
     setMessage("");
-    setAttachment(null);
     setFile(null);
     setUploadProgress(0);
     setSending(false);
-  }, [selectedUser, token]);
+  }, [selectedUser, token, scheduleUsersRefresh]);
 
   const handleFileChange = (e) => {
+    setSendError("");
     const selected = e.target.files[0];
     if (!selected) return;
-    setFile(selected);
-    let previewUrl = "";
-    if (selected.type.startsWith("image") || selected.type.startsWith("video") || selected.type.startsWith("audio")) {
-      previewUrl = URL.createObjectURL(selected);
+    if (!(selected instanceof Blob)) {
+      setSendError("Selected attachment is invalid. Please choose again.");
+      return;
     }
-    setAttachment({ name: selected.name, type: selected.type, kind: "file", url: previewUrl });
+    setFile(selected);
+  };
+
+  const formatDateSeparator = (time) => {
+    if (!time) return "";
+    const messageDate = new Date(time);
+    const now = new Date();
+    const startOfMessageDay = new Date(
+      messageDate.getFullYear(),
+      messageDate.getMonth(),
+      messageDate.getDate()
+    );
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const dayDiff = Math.floor(
+      (startOfToday.getTime() - startOfMessageDay.getTime()) / (1000 * 60 * 60 * 24)
+    );
+
+    if (dayDiff < 7) {
+      return messageDate.toLocaleDateString([], { weekday: "long" });
+    }
+    return messageDate.toLocaleDateString([], {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
   };
 
   const handleSend = () => {
+    setSendError("");
     if ((!message && !file) || !selectedUser || !token) return;
 
     setSending(true);
@@ -178,15 +243,18 @@ function MobileChat() {
       };
       xhr.onload = () => {
         try {
-          const data = JSON.parse(xhr.responseText);
+          const data = xhr.responseText ? JSON.parse(xhr.responseText) : {};
           if (xhr.status >= 400) throw new Error(data.message || "Failed to send message");
           const newMsg = data.newMessage;
+          if (!newMsg) throw new Error("Upload finished, but no message was returned.");
           setMessages((prev) => [...prev, newMsg]);
           setMessage("");
           setFile(null);
-          refreshUsers?.();
+          if (fileInputRef.current) fileInputRef.current.value = "";
+          scheduleUsersRefresh(120);
         } catch (err) {
           console.warn(err);
+          setSendError(err.message || "Unable to send file");
         } finally {
           setSending(false);
           setUploadProgress(0);
@@ -194,6 +262,7 @@ function MobileChat() {
       };
       xhr.onerror = () => {
         console.warn("Upload error");
+        setSendError("Network error uploading file");
         setSending(false);
         setUploadProgress(0);
       };
@@ -216,9 +285,10 @@ function MobileChat() {
           const newMsg = data.newMessage;
           setMessages((prev) => [...prev, newMsg]);
           setMessage("");
-          refreshUsers?.();
+          scheduleUsersRefresh(120);
         } catch (err) {
           console.warn(err);
+          setSendError(err.message || "Unable to send message");
         } finally {
           setSending(false);
         }
@@ -226,12 +296,6 @@ function MobileChat() {
       send();
     }
   };
-
-  const handleLogout = () => {
-    logout();
-    navigate("/");
-  };
-
 
   return (
     <div className="chat-bg vh-100 d-flex flex-column">
@@ -241,7 +305,7 @@ function MobileChat() {
           className="btn btn-light btn-sm me-3"
           onClick={() => navigate("/chat")}
         >
-          ←
+          {"<-"}
         </button>
         {renderAvatar(selectedUser?.profilePic, selectedUser?.username, 40)}
         <div>
@@ -260,41 +324,49 @@ function MobileChat() {
           <div className="text-center text-muted">No messages yet.</div>
         ) : (
           messages.map((msg, i) => {
+            const currentDateLabel = formatDateSeparator(msg.createdAt);
+            const prevDateLabel =
+              i > 0 ? formatDateSeparator(messages[i - 1]?.createdAt) : "";
+            const shouldShowDateDivider = currentDateLabel && currentDateLabel !== prevDateLabel;
             const isMine = String(msg.senderId) === String(user?._id);
             return (
-              <div
-                key={i}
-                className={`d-flex ${isMine ? "justify-content-end" : "justify-content-start"
-                  } mb-2`}
-              >
+              <React.Fragment key={msg._id || `${msg.senderId}-${msg.createdAt || i}`}>
+                {shouldShowDateDivider && (
+                  <div className="chat-date-separator">{currentDateLabel}</div>
+                )}
                 <div
-                  className={isMine ? "chat-bubble sent" : "chat-bubble received"}
+                  className={`d-flex ${isMine ? "justify-content-end" : "justify-content-start"
+                    } mb-2`}
                 >
-                  {msg.text}
-                  {msg.fileUrl && (
-                    <div className="mt-2">
-                      {msg.fileType && msg.fileType.startsWith("image") ? (
-                        <img
-                          src={msg.fileUrl}
-                          alt={msg.fileName}
-                          style={{
-                            maxWidth: "200px",
-                            borderRadius: "10px",
-                          }}
-                        />
-                      ) : (
-                        <a
-                          href={msg.fileUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          {msg.fileName || "Download file"}
-                        </a>
-                      )}
-                    </div>
-                  )}
+                  <div
+                    className={isMine ? "chat-bubble sent" : "chat-bubble received"}
+                  >
+                    {msg.text}
+                    {msg.fileUrl && (
+                      <div className="mt-2">
+                        {msg.fileType && msg.fileType.startsWith("image") ? (
+                          <img
+                            src={msg.fileUrl}
+                            alt={msg.fileName}
+                            style={{
+                              maxWidth: "200px",
+                              borderRadius: "10px",
+                            }}
+                          />
+                        ) : (
+                          <a
+                            href={msg.fileUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {msg.fileName || "Download file"}
+                          </a>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
+              </React.Fragment>
             );
           })
         )}
@@ -310,8 +382,8 @@ function MobileChat() {
           onChange={(e) => setMessage(e.target.value)}
         />
         <label className="btn btn-secondary mb-0">
-          📎
-          <input type="file" hidden onChange={handleFileChange} />
+          Attach
+          <input ref={fileInputRef} type="file" hidden onChange={handleFileChange} />
         </label>
         {file && (
           <span className="ms-2 text-white" style={{ fontSize: '0.9rem' }}>{file.name}</span>
@@ -332,6 +404,7 @@ function MobileChat() {
           {sending ? "Sending..." : "Send"}
         </button>
       </div>
+      {sendError && <div className="text-danger small px-2 pb-2">{sendError}</div>}
     </div>
   );
 }
